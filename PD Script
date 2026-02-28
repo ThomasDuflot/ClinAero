@@ -1,0 +1,29 @@
+path <- "C:/Users/Thomas-Marianne/Desktop/ClinAero"
+
+data_clin <- read.csv(file.path(path, "Data CLIN.csv"),
+                      header = TRUE,
+                      sep = ";",
+                      stringsAsFactors = TRUE)
+
+data_pd <- read.csv(file.path(path, "Data PD.csv"),
+                    header = TRUE,
+                    sep = ";",
+                    stringsAsFactors = TRUE)
+
+str(data_clin)
+str(data_pd)
+
+library(dplyr)
+
+finished_id <- data_pd %>%
+  group_by(ID) %>%
+  summarise(
+    Finished = as.integer(any(T_PROTO == "T60" & !is.na(EN)))
+  )
+
+data_pd <- data_pd %>%
+  left_join(finished_id, by = "ID")
+data_clin <- data_clin %>%
+  left_join(finished_id, by = "ID")
+data_pd %>% distinct(ID, Finished)
+data_clin %>% distinct(ID, Finished)
