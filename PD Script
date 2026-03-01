@@ -1,3 +1,6 @@
+
+library(dplyr)
+
 path <- "C:/Users/Thomas-Marianne/Desktop/ClinAero"
 
 data_clin <- read.csv(file.path(path, "Data CLIN.csv"),
@@ -13,17 +16,83 @@ data_pd <- read.csv(file.path(path, "Data PD.csv"),
 str(data_clin)
 str(data_pd)
 
-library(dplyr)
+ids_clin <- sort(unique(data_clin$ID))
+ids_pd   <- sort(unique(data_pd$ID))
 
-finished_id <- data_pd %>%
-  group_by(ID) %>%
-  summarise(
-    Finished = as.integer(any(T_PROTO == "T60" & !is.na(EN)))
-  )
+length(ids_clin)   # number of unique IDs in clin
+length(ids_pd)     # number of unique IDs in pd
+
+length(intersect(ids_clin, ids_pd))  # common IDs
+
 
 data_pd <- data_pd %>%
-  left_join(finished_id, by = "ID")
-data_clin <- data_clin %>%
-  left_join(finished_id, by = "ID")
-data_pd %>% distinct(ID, Finished)
-data_clin %>% distinct(ID, Finished)
+  group_by(ID) %>%
+  mutate(
+    Finished = as.integer(any(T_PROTO == "T60" & !is.na(EN)))
+  ) %>%
+  ungroup()
+
+relief_id <- data_pd %>%
+  group_by(ID) %>%
+  summarise(
+    has_T60 = any(T_PROTO == "T60"),
+    EN_T60  = EN[T_PROTO == "T60"][1],
+    Relief = case_when(
+      !has_T60 ~ NA_real_,
+      has_T60 & !is.na(EN_T60) & EN_T60 < 4 ~ 1,
+      has_T60 & !is.na(EN_T60) & EN_T60 >= 4 ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(ID, Relief)
+
+
+data_pd <- data_pd %>%
+  left_join(relief_id, by = "ID")
+
+
+# 1) First row per ID from data_pd (baseline = smallest T_REEL)
+pd_first <- data_pd %>%
+  arrange(ID, T_REEL) %>%
+  group_by(ID) %>%
+  slice(1) %>%
+  ungroup()
+
+# 2) IMPORTANT +++ strict ID matching
+ids_clin <- sort(unique(data_clin$ID))
+ids_pd   <- sort(unique(pd_first$ID))
+
+missing_in_pd   <- setdiff(ids_clin, ids_pd)
+missing_in_clin <- setdiff(ids_pd, ids_clin)
+
+if (length(missing_in_pd) > 0 || length(missing_in_clin) > 0) {
+  stop(
+    paste0(
+      "ID mismatch detected.\n",
+      "In data_clin but not in data_pd: ", paste(missing_in_pd, collapse = ", "), "\n",
+      "In data_pd but not in data_clin: ", paste(missing_in_clin, collapse = ", ")
+    )
+  )
+}
+
+# 3) Join ALL columns. If duplicates exist, overwrite with pd values.
+common_cols <- intersect(names(data_clin), names(pd_first))
+common_cols <- setdiff(common_cols, "ID")
+
+tmp <- data_clin %>%
+  left_join(pd_first, by = "ID", suffix = c(".clin", ".pd"))
+
+# Overwrite only if there are duplicated names
+if (length(common_cols) > 0) {
+  for (v in common_cols) {
+    tmp[[v]] <- tmp[[paste0(v, ".pd")]]
+  }
+}
+
+# Drop suffixed columns safely (any_of doesn't error if names are absent)
+drop_cols <- c(paste0(common_cols, ".clin"), paste0(common_cols, ".pd"))
+data_clin <- tmp %>% select(-any_of(drop_cols))
+rm(tmp)
+
+
+
