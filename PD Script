@@ -140,3 +140,305 @@ if (length(common_cols) > 0) {
 drop_cols <- c(paste0(common_cols, ".clin"), paste0(common_cols, ".pd"))
 data_clin <- tmp %>% select(-any_of(drop_cols))
 rm(tmp)
+
+
+
+
+
+
+
+
+
+# =========================================
+# TABLE 1 (manual) -> flextable -> Word
+# - Overall / IV / NEB with N in headers
+# - All numeric vars: mean ± sd
+# - Categorical: n (%)
+# - Add "(n=...)" ONLY when missing exists in that column
+# - p-values with superscripts: a t-test, b Wilcoxon, c Chi², d Fisher
+# - Subrows for Cotreatment and Side Effects
+# - 3 significant digits for numbers (110, 23.4, 3.29 style)
+# =========================================
+
+library(dplyr)
+library(tibble)
+library(moments)
+library(flextable)
+library(officer)
+
+# --------------------------
+# 1) Formatting helpers
+# --------------------------
+fmt3 <- function(x) {
+  if (length(x) == 0) return("")
+  ifelse(is.na(x), "", format(signif(x, 3), trim = TRUE, scientific = FALSE))
+}
+
+fmt_mean_sd <- function(x, N_ref) {
+  n <- sum(!is.na(x))
+  if (n == 0) return("")
+  m <- mean(x, na.rm = TRUE)
+  s <- sd(x, na.rm = TRUE)
+
+  base <- paste0(fmt3(m), " ± ", fmt3(s))
+  if (!missing(N_ref) && n < N_ref) paste0(base, " (n=", n, ")") else base
+}
+
+fmt_n_pct <- function(x01, N_ref) {
+  n <- sum(!is.na(x01))
+  if (n == 0) return("")
+  n1 <- sum(x01 == 1, na.rm = TRUE)
+  pct <- 100 * n1 / n
+
+  base <- paste0(n1, " (", fmt3(pct), "%)")
+  if (!missing(N_ref) && n < N_ref) paste0(base, " (n=", n, ")") else base
+}
+
+fmt_p <- function(p) {
+  if (is.na(p) || length(p) == 0) return("")
+  if (p < 0.001) return("<0.001")
+  sprintf("%.3f", p)
+}
+
+# --------------------------
+# 2) Normality rule (overall)
+# --------------------------
+normality_flag <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) < 3) return(FALSE)
+  skw <- tryCatch(moments::skewness(x), error = function(e) NA_real_)
+  krt <- tryCatch(moments::kurtosis(x), error = function(e) NA_real_)
+  isTRUE(!is.na(skw) && !is.na(krt) && abs(skw) < 1 && krt >= 2 && krt <= 5)
+}
+
+# numeric test with code: a=t-test, b=Wilcoxon
+test_num_with_code <- function(x, g) {
+  ok <- !is.na(x) & !is.na(g)
+  x <- x[ok]; g <- droplevels(g[ok])
+  if (length(unique(g)) < 2) return(list(p = NA_real_, code = ""))
+
+  if (normality_flag(x)) {
+    list(p = stats::t.test(x ~ g)$p.value, code = "a")
+  } else {
+    list(p = stats::wilcox.test(x ~ g)$p.value, code = "b")
+  }
+}
+
+# categorical test with code: c=Chi², d=Fisher
+test_cat_with_code <- function(x, g) {
+  ok <- !is.na(x) & !is.na(g)
+  x <- x[ok]; g <- droplevels(g[ok])
+  if (length(unique(g)) < 2) return(list(p = NA_real_, code = ""))
+
+  tab <- table(x, g)
+  if (any(tab < 5)) {
+    list(p = stats::fisher.test(tab)$p.value, code = "d")
+  } else {
+    list(p = stats::chisq.test(tab)$p.value, code = "c")
+  }
+}
+
+# --------------------------
+# 3) Prep dataset (1 row per ID)
+# --------------------------
+data_tab <- data_clin %>%
+  mutate(
+    ARM = factor(ARM, levels = c("IV", "NEB")),
+    Sex_Man = ifelse(SEX == "M", 1L, 0L),
+    SideEffects = as.integer(ES_NAUSEE == 1 | ES_SEDATION == 1 | ES_R == 1 | ES_OTHER == 1)
+  )
+
+overall <- data_tab
+iv  <- filter(data_tab, ARM == "IV")
+neb <- filter(data_tab, ARM == "NEB")
+
+N_overall <- nrow(overall)
+N_iv      <- nrow(iv)
+N_neb     <- nrow(neb)
+
+# --------------------------
+# 4) Row builder
+# --------------------------
+rows <- list()
+
+add_row <- function(label, overall_val, iv_val, neb_val, p_obj = NULL) {
+  rows[[length(rows) + 1]] <<- tibble(
+    Variable = label,
+    Overall  = overall_val,
+    IV       = iv_val,
+    NEB      = neb_val,
+    p_num    = if (!is.null(p_obj)) p_obj$p else NA_real_,
+    p_code   = if (!is.null(p_obj)) p_obj$code else ""
+  )
+}
+
+# --------------------------
+# 5) Table content
+# --------------------------
+
+# Sex
+pobj <- test_cat_with_code(data_tab$Sex_Man, data_tab$ARM)
+add_row(
+  "Sex (Man)",
+  fmt_n_pct(overall$Sex_Man, N_overall),
+  fmt_n_pct(iv$Sex_Man, N_iv),
+  fmt_n_pct(neb$Sex_Man, N_neb),
+  pobj
+)
+
+# ALL numeric vars as mean ± sd
+num_map <- c(
+  "AGE"           = "Age",
+  "WEIGHT"        = "Weight",
+  "HEIGHT"        = "Height",
+  "BMI"           = "Body Mass Index",
+  "HR"            = "Heart Rate",
+  "RR"            = "Respiratory Rate",
+  "SBP"           = "Systolic Blood Pressure",
+  "DBP"           = "Diastolic Blood Pressure",
+  "Intake"        = "Number of Intake",
+  "Rescue_Intake" = "Number of Rescue Intake",
+  "EN"            = "Numeric Rating Scale"
+)
+
+for (v in names(num_map)) {
+  pobj <- test_num_with_code(data_tab[[v]], data_tab$ARM)
+  add_row(
+    num_map[[v]],
+    fmt_mean_sd(overall[[v]], N_overall),
+    fmt_mean_sd(iv[[v]], N_iv),
+    fmt_mean_sd(neb[[v]], N_neb),
+    pobj
+  )
+}
+
+# Binary outcomes (n %)
+bin_map <- c(
+  "Relief"      = "Relief",
+  "Rescue"      = "Rescue",
+  "POLYALGIC"   = "Polyalgic",
+  "COTTT"       = "Cotreatment",
+  "SideEffects" = "Side Effects"
+)
+
+for (v in names(bin_map)) {
+  pobj <- test_cat_with_code(data_tab[[v]], data_tab$ARM)
+  add_row(
+    bin_map[[v]],
+    fmt_n_pct(overall[[v]], N_overall),
+    fmt_n_pct(iv[[v]], N_iv),
+    fmt_n_pct(neb[[v]], N_neb),
+    pobj
+  )
+}
+
+# Subrows: Cotreatment
+add_row("  Cotreatment details", "", "", "", NULL)
+
+cottt_sub <- c(
+  "ANALGESIC_TS"    = "Analgesic",
+  "PHLOROGLUCIN_TS" = "Phloroglucinol",
+  "NEFOPAM_TS"      = "Nefopam",
+  "PARACETAM_TS"    = "Paracetamol",
+  "NSAI_TS"         = "NSAID"
+)
+
+for (v in names(cottt_sub)) {
+  pobj <- test_cat_with_code(data_tab[[v]], data_tab$ARM)
+  add_row(
+    paste0("   - ", cottt_sub[[v]]),
+    fmt_n_pct(overall[[v]], N_overall),
+    fmt_n_pct(iv[[v]], N_iv),
+    fmt_n_pct(neb[[v]], N_neb),
+    pobj
+  )
+}
+
+# Subrows: Side Effects
+add_row("  Side Effects details", "", "", "", NULL)
+
+es_sub <- c(
+  "ES_NAUSEE"   = "Nausea",
+  "ES_SEDATION" = "Sedation",
+  "ES_R"        = "Respiratory",
+  "ES_OTHER"    = "Other"
+)
+
+for (v in names(es_sub)) {
+  pobj <- test_cat_with_code(data_tab[[v]], data_tab$ARM)
+  add_row(
+    paste0("   - ", es_sub[[v]]),
+    fmt_n_pct(overall[[v]], N_overall),
+    fmt_n_pct(iv[[v]], N_iv),
+    fmt_n_pct(neb[[v]], N_neb),
+    pobj
+  )
+}
+
+final_table <- bind_rows(rows) %>%
+  mutate(p_value_txt = ifelse(is.na(p_num), "", fmt_p(p_num)))
+
+# --------------------------
+# 6) Flextable (NEJM-ish) + superscripts
+# --------------------------
+ft <- flextable(final_table %>% select(Variable, Overall, IV, NEB, p_value_txt, p_code)) %>%
+  set_header_labels(
+    Overall = paste0("Overall (N=", N_overall, ")"),
+    IV      = paste0("IV (N=", N_iv, ")"),
+    NEB     = paste0("NEB (N=", N_neb, ")"),
+    p_value_txt = "p-value"
+  ) %>%
+  theme_booktabs() %>%
+  font(fontname = "Times New Roman", part = "all") %>%
+  fontsize(size = 10, part = "all") %>%
+  padding(padding = 2, part = "all") %>%
+  bold(part = "header") %>%
+  align(align = "left", j = 1, part = "all") %>%
+  align(align = "center", j = 2:5, part = "all")
+
+# add superscript letter to p-values
+ft <- compose(
+  ft, j = "p_value_txt",
+  value = as_paragraph(
+    as_chunk(p_value_txt),
+    as_sup(as_chunk(p_code))
+  )
+)
+
+# drop helper column used for superscripts
+ft <- delete_columns(ft, j = "p_code") %>%
+  autofit()
+
+# footer legend
+ft <- add_footer_lines(
+  ft,
+  values = "Tests: a t-test (overall skew/kurtosis normal); b Wilcoxon rank-sum; c Chi-square; d Fisher's exact. (n=...) shown only when missing data."
+)
+
+ft
+
+# --------------------------
+# 7) Export to Word
+# --------------------------
+doc <- read_docx() %>%
+  body_add_par("Table 1. Baseline Characteristics", style = "heading 2") %>%
+  body_add_flextable(ft)
+
+print(doc, target = "Table1_NEJM_manual.docx")
+
+
+set.seed(123)
+
+my_theme <- theme_minimal(base_size = 16) +
+  theme(
+    axis.title = element_text(size = 18, color = "black"),      # Axis labels size and color
+    axis.text = element_text(size = 16, color = "black"),       # Axis ticks size and color
+    axis.line = element_line(linewidth = 1.5),                  # Axis lines size
+    legend.title = element_text(size = 18, color = "black"),    # Legend title size and color
+    legend.text = element_text(size = 16, color = "black")      # Legend text size and color
+  )
+
+
+
+
+
