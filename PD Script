@@ -51,6 +51,53 @@ data_pd <- data_pd %>%
   left_join(relief_id, by = "ID")
 
 
+data_pd <- data_pd %>%
+  group_by(ID) %>%
+  mutate(
+    Intake = case_when(
+      first(ARM) == "IV"  ~ sum(T_PROTO %in% c("T0","T5","T10")  & !is.na(DOSE)),
+      first(ARM) == "NEB" ~ sum(T_PROTO %in% c("T0","T10","T20") & !is.na(DOSE)),
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  ungroup()
+
+data_pd <- data_pd %>%
+  group_by(ID) %>%
+  mutate(
+    Rescue = case_when(
+      first(ARM) == "IV" ~ as.integer(any(
+        T_PROTO %in% c("T15","T20","T25","T30","T35","T40","T45","T50","T55","T60") &
+          !is.na(DOSE)
+      )),
+      first(ARM) == "NEB" ~ as.integer(any(
+        T_PROTO %in% c("T30","T35","T40","T45","T50","T55","T60") &
+          !is.na(DOSE)
+      )),
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  ungroup()
+
+
+data_pd <- data_pd %>%
+  group_by(ID) %>%
+  mutate(
+    Rescue_Intake = case_when(
+      first(ARM) == "IV"  ~ sum(
+        T_PROTO %in% c("T15","T20","T25","T30","T35","T40","T45","T50","T55","T60") &
+          !is.na(DOSE)
+      ),
+      first(ARM) == "NEB" ~ sum(
+        T_PROTO %in% c("T30","T35","T40","T45","T50","T55","T60") &
+          !is.na(DOSE)
+      ),
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  ungroup()
+
+
 # 1) First row per ID from data_pd (baseline = smallest T_REEL)
 pd_first <- data_pd %>%
   arrange(ID, T_REEL) %>%
@@ -93,6 +140,3 @@ if (length(common_cols) > 0) {
 drop_cols <- c(paste0(common_cols, ".clin"), paste0(common_cols, ".pd"))
 data_clin <- tmp %>% select(-any_of(drop_cols))
 rm(tmp)
-
-
-
