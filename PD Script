@@ -1,7 +1,16 @@
 
 library(dplyr)
+library(tibble)
+library(moments)
+library(flextable)
+library(officer)
+library(ggplot2)
+library(ggpubr)
+library(ggsci)
 
-path <- "C:/Users/Thomas-Marianne/Desktop/ClinAero"
+setwd("C:/Users/thomas.duflot/Desktop/CLIN Aeromorph")
+#path <- "C:/Users/Thomas-Marianne/Desktop/ClinAero"
+path <- "C:/Users/thomas.duflot/Desktop/CLIN Aeromorph"
 
 data_clin <- read.csv(file.path(path, "Data CLIN.csv"),
                       header = TRUE,
@@ -160,11 +169,8 @@ rm(tmp)
 # - 3 significant digits for numbers (110, 23.4, 3.29 style)
 # =========================================
 
-library(dplyr)
-library(tibble)
-library(moments)
-library(flextable)
-library(officer)
+
+
 
 # --------------------------
 # 1) Formatting helpers
@@ -194,10 +200,14 @@ fmt_n_pct <- function(x01, N_ref) {
   if (!missing(N_ref) && n < N_ref) paste0(base, " (n=", n, ")") else base
 }
 
+# Vectorized p formatter (FIX)
 fmt_p <- function(p) {
-  if (is.na(p) || length(p) == 0) return("")
-  if (p < 0.001) return("<0.001")
-  sprintf("%.3f", p)
+  if (length(p) == 0) return("")
+  out <- rep("", length(p))
+  ok <- !is.na(p)
+  out[ok & p < 0.001] <- "<0.001"
+  out[ok & p >= 0.001] <- sprintf("%.3f", p[ok & p >= 0.001])
+  out
 }
 
 # --------------------------
@@ -214,27 +224,52 @@ normality_flag <- function(x) {
 # numeric test with code: a=t-test, b=Wilcoxon
 test_num_with_code <- function(x, g) {
   ok <- !is.na(x) & !is.na(g)
-  x <- x[ok]; g <- droplevels(g[ok])
+  x <- x[ok]
+  g <- droplevels(as.factor(g[ok]))
+
   if (length(unique(g)) < 2) return(list(p = NA_real_, code = ""))
 
+  # protect: need at least 2 obs per group for most tests
+  n_by <- table(g)
+  if (any(n_by < 2)) return(list(p = NA_real_, code = ""))
+
+  # protect: constant x
+  if (sd(x, na.rm = TRUE) == 0) return(list(p = NA_real_, code = ""))
+
   if (normality_flag(x)) {
-    list(p = stats::t.test(x ~ g)$p.value, code = "a")
+    p <- tryCatch(stats::t.test(x ~ g)$p.value, error = function(e) NA_real_)
+    list(p = p, code = "a")
   } else {
-    list(p = stats::wilcox.test(x ~ g)$p.value, code = "b")
+    # wilcox can fail on ties/constant within groups; catch it
+    p <- tryCatch(stats::wilcox.test(x ~ g, exact = FALSE)$p.value, error = function(e) NA_real_)
+    list(p = p, code = "b")
   }
 }
 
 # categorical test with code: c=Chi², d=Fisher
 test_cat_with_code <- function(x, g) {
   ok <- !is.na(x) & !is.na(g)
-  x <- x[ok]; g <- droplevels(g[ok])
+  x <- x[ok]
+  g <- droplevels(as.factor(g[ok]))
+
   if (length(unique(g)) < 2) return(list(p = NA_real_, code = ""))
 
   tab <- table(x, g)
-  if (any(tab < 5)) {
-    list(p = stats::fisher.test(tab)$p.value, code = "d")
+
+  # If any expected count < 5 -> Fisher (more standard rule)
+  chi <- tryCatch(suppressWarnings(stats::chisq.test(tab, correct = FALSE)),
+                  error = function(e) NULL)
+
+  if (is.null(chi)) {
+    p <- tryCatch(stats::fisher.test(tab)$p.value, error = function(e) NA_real_)
+    return(list(p = p, code = "d"))
+  }
+
+  if (any(chi$expected < 5)) {
+    p <- tryCatch(stats::fisher.test(tab)$p.value, error = function(e) NA_real_)
+    list(p = p, code = "d")
   } else {
-    list(p = stats::chisq.test(tab)$p.value, code = "c")
+    list(p = chi$p.value, code = "c")
   }
 }
 
@@ -244,8 +279,12 @@ test_cat_with_code <- function(x, g) {
 data_tab <- data_clin %>%
   mutate(
     ARM = factor(ARM, levels = c("IV", "NEB")),
-    Sex_Man = ifelse(SEX == "M", 1L, 0L),
-    SideEffects = as.integer(ES_NAUSEE == 1 | ES_SEDATION == 1 | ES_R == 1 | ES_OTHER == 1)
+    Sex_Man = ifelse(SEX == "M", 1L, ifelse(is.na(SEX), NA_integer_, 0L)),
+    SideEffects = dplyr::if_else(
+      is.na(ES_NAUSEE) & is.na(ES_SEDATION) & is.na(ES_R) & is.na(ES_OTHER),
+      NA_integer_,
+      as.integer(ES_NAUSEE == 1 | ES_SEDATION == 1 | ES_R == 1 | ES_OTHER == 1)
+    )
   )
 
 overall <- data_tab
@@ -302,6 +341,7 @@ num_map <- c(
 )
 
 for (v in names(num_map)) {
+  if (!v %in% names(data_tab)) next
   pobj <- test_num_with_code(data_tab[[v]], data_tab$ARM)
   add_row(
     num_map[[v]],
@@ -322,6 +362,7 @@ bin_map <- c(
 )
 
 for (v in names(bin_map)) {
+  if (!v %in% names(data_tab)) next
   pobj <- test_cat_with_code(data_tab[[v]], data_tab$ARM)
   add_row(
     bin_map[[v]],
@@ -344,6 +385,7 @@ cottt_sub <- c(
 )
 
 for (v in names(cottt_sub)) {
+  if (!v %in% names(data_tab)) next
   pobj <- test_cat_with_code(data_tab[[v]], data_tab$ARM)
   add_row(
     paste0("   - ", cottt_sub[[v]]),
@@ -365,6 +407,7 @@ es_sub <- c(
 )
 
 for (v in names(es_sub)) {
+  if (!v %in% names(data_tab)) next
   pobj <- test_cat_with_code(data_tab[[v]], data_tab$ARM)
   add_row(
     paste0("   - ", es_sub[[v]]),
@@ -376,12 +419,23 @@ for (v in names(es_sub)) {
 }
 
 final_table <- bind_rows(rows) %>%
-  mutate(p_value_txt = ifelse(is.na(p_num), "", fmt_p(p_num)))
+  mutate(
+    p_value_txt = fmt_p(p_num),
+    p_sup = dplyr::recode(p_code,
+      "a" = "ᵃ",
+      "b" = "ᵇ",
+      "c" = "ᶜ",
+      "d" = "ᵈ",
+      .default = ""
+    ),
+    p_value_txt = ifelse(p_value_txt == "", "", paste0(p_value_txt, p_sup))
+  ) %>%
+  select(-p_sup)   # optionnel
 
 # --------------------------
 # 6) Flextable (NEJM-ish) + superscripts
 # --------------------------
-ft <- flextable(final_table %>% select(Variable, Overall, IV, NEB, p_value_txt, p_code)) %>%
+ft <- flextable(final_table %>% select(Variable, Overall, IV, NEB, p_value_txt)) %>%
   set_header_labels(
     Overall = paste0("Overall (N=", N_overall, ")"),
     IV      = paste0("IV (N=", N_iv, ")"),
@@ -394,28 +448,16 @@ ft <- flextable(final_table %>% select(Variable, Overall, IV, NEB, p_value_txt, 
   padding(padding = 2, part = "all") %>%
   bold(part = "header") %>%
   align(align = "left", j = 1, part = "all") %>%
-  align(align = "center", j = 2:5, part = "all")
-
-# add superscript letter to p-values
-ft <- compose(
-  ft, j = "p_value_txt",
-  value = as_paragraph(
-    as_chunk(p_value_txt),
-    as_sup(as_chunk(p_code))
-  )
-)
-
-# drop helper column used for superscripts
-ft <- delete_columns(ft, j = "p_code") %>%
+  align(align = "center", j = 2:5, part = "all") %>%
   autofit()
 
-# footer legend
 ft <- add_footer_lines(
   ft,
-  values = "Tests: a t-test (overall skew/kurtosis normal); b Wilcoxon rank-sum; c Chi-square; d Fisher's exact. (n=...) shown only when missing data."
+  values = "Tests: ᵃ t-test (overall skew/kurtosis normal); ᵇ Wilcoxon rank-sum; ᶜ Chi-square; ᵈ Fisher's exact. (n=...) shown only when missing data."
 )
 
 ft
+
 
 # --------------------------
 # 7) Export to Word
@@ -424,7 +466,10 @@ doc <- read_docx() %>%
   body_add_par("Table 1. Baseline Characteristics", style = "heading 2") %>%
   body_add_flextable(ft)
 
-print(doc, target = "Table1_NEJM_manual.docx")
+print(doc, target = "Table1.docx")
+
+
+
 
 
 set.seed(123)
@@ -439,6 +484,456 @@ my_theme <- theme_minimal(base_size = 16) +
   )
 
 
+
+
+
+# --------------------------
+# Helpers
+# --------------------------
+fmt3 <- function(x) {
+  if (length(x) == 0) return("")
+  ifelse(is.na(x), "", format(signif(x, 3), trim = TRUE, scientific = FALSE))
+}
+
+fmt_mean_sd <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return("")
+  m <- mean(x)
+  s <- stats::sd(x)
+  paste0(fmt3(m), " ± ", fmt3(s))
+}
+
+fmt_p <- function(p) {
+  if (length(p) == 0) return("")
+  out <- rep("", length(p))
+  ok <- !is.na(p)
+  out[ok & p < 0.001] <- "<0.001"
+  out[ok & p >= 0.001] <- sprintf("%.3f", p[ok & p >= 0.001])
+  out
+}
+
+# --------------------------
+# Prep (use data_pd directly)
+# --------------------------
+dp <- data_pd %>%
+  mutate(
+    ARM = factor(ARM, levels = c("IV", "NEB")),
+    Time_min = as.integer(gsub("^T", "", as.character(T_PROTO)))
+  )
+
+# --------------------------
+# Build table
+# --------------------------
+tab_time <- dp %>%
+  filter(!is.na(EN), !is.na(ARM), !is.na(Time_min)) %>%
+  group_by(Time_min) %>%
+  summarise(
+    N_overall = sum(!is.na(EN)),
+    N_IV      = sum(!is.na(EN[ARM == "IV"])),
+    N_NEB     = sum(!is.na(EN[ARM == "NEB"])),
+
+    Overall = fmt_mean_sd(EN),
+    IV      = fmt_mean_sd(EN[ARM == "IV"]),
+    NEB     = fmt_mean_sd(EN[ARM == "NEB"]),
+
+    p_raw   = {
+      if (N_IV >= 1 && N_NEB >= 1) {
+        tryCatch(
+          stats::wilcox.test(EN ~ ARM, exact = FALSE)$p.value,
+          error = function(e) NA_real_
+        )
+      } else NA_real_
+    },
+    .groups = "drop"
+  ) %>%
+  arrange(Time_min) %>%
+  mutate(
+    p_adj = p.adjust(p_raw, method = "holm"),
+    `p-value (Holm)` = fmt_p(p_adj)
+  ) %>%
+  select(
+    `Time (min)` = Time_min,
+    `N` = N_overall,
+    `N (IV)` = N_IV,
+    `N (NEB)` = N_NEB,
+    Overall, IV, NEB,
+    `p-value (Holm)`
+  )
+
+# --------------------------
+# Flextable
+# --------------------------
+ft_time <- flextable::flextable(tab_time) %>%
+  flextable::theme_booktabs() %>%
+  flextable::font(fontname = "Times New Roman", part = "all") %>%
+  flextable::fontsize(size = 10, part = "all") %>%
+  flextable::padding(padding = 2, part = "all") %>%
+  flextable::bold(part = "header") %>%
+  flextable::align(align = "center", part = "all") %>%
+  flextable::align(j = c("Overall","IV","NEB"), align = "center", part = "all") %>%
+  flextable::autofit() %>%
+  flextable::add_footer_lines(
+    values = "Numeric Rating Scale (0–10) reported as mean ± SD. P-values: Wilcoxon rank-sum test (IV vs NEB) at each timepoint with Holm correction for multiple testing."
+  )
+
+ft_time
+
+doc <- officer::read_docx() %>%
+  officer::body_add_par(
+    "Table X. Numeric Rating Scale over time",
+    style = "heading 2"
+  )
+
+doc <- flextable::body_add_flextable(doc, ft_time)
+
+print(doc, target = "Table_NRS_Time.docx")
+
+
+dp <- data_pd %>%
+  mutate(
+    ARM = factor(ARM, levels = c("IV", "NEB")),
+    Time_min = as.integer(gsub("^T", "", as.character(T_PROTO))),
+    Responder = ifelse(EN < 4, 1, 0)
+  )
+
+fmt_pct <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return("")
+  n1 <- sum(x == 1)
+  pct <- 100 * n1 / length(x)
+  paste0(n1, " (", sprintf("%.1f", pct), "%)")
+}
+
+tab_time_ext <- dp %>%
+  filter(!is.na(EN), !is.na(ARM), !is.na(Time_min)) %>%
+  group_by(Time_min) %>%
+  summarise(
+    N_overall = n(),
+    N_IV      = sum(ARM == "IV"),
+    N_NEB     = sum(ARM == "NEB"),
+
+    Mean_SD_Overall = fmt_mean_sd(EN),
+    Mean_SD_IV      = fmt_mean_sd(EN[ARM == "IV"]),
+    Mean_SD_NEB     = fmt_mean_sd(EN[ARM == "NEB"]),
+
+    Relief_Overall  = fmt_pct(Responder),
+    Relief_IV       = fmt_pct(Responder[ARM == "IV"]),
+    Relief_NEB      = fmt_pct(Responder[ARM == "NEB"]),
+
+    p_cont_raw = tryCatch(
+      wilcox.test(EN ~ ARM, exact = FALSE)$p.value,
+      error = function(e) NA_real_
+    ),
+
+    p_bin_raw = {
+      tab <- table(Responder, ARM)
+      if (all(dim(tab) == c(2,2))) {
+        if (any(tab < 5)) fisher.test(tab)$p.value
+        else chisq.test(tab, correct = FALSE)$p.value
+      } else NA_real_
+    },
+
+    .groups = "drop"
+  ) %>%
+  arrange(Time_min) %>%
+  mutate(
+    p_cont = fmt_p(p.adjust(p_cont_raw, method = "holm")),
+    p_bin  = fmt_p(p.adjust(p_bin_raw, method = "holm"))
+  ) %>%
+  select(
+    `Time (min)` = Time_min,
+    N_overall, N_IV, N_NEB,
+    Mean_SD_Overall, Mean_SD_IV, Mean_SD_NEB,
+    Relief_Overall, Relief_IV, Relief_NEB,
+    p_cont, p_bin
+  )
+
+# ---------- helpers ----------
+fmt3 <- function(x) {
+  if (length(x) == 0) return("")
+  ifelse(is.na(x), "", format(signif(x, 3), trim = TRUE, scientific = FALSE))
+}
+
+fmt_mean_sd <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return("")
+  m <- mean(x)
+  s <- stats::sd(x)
+  paste0(fmt3(m), " ± ", fmt3(s))
+}
+
+fmt_n_pct <- function(x01) {
+  x01 <- x01[!is.na(x01)]
+  if (length(x01) == 0) return("")
+  n1 <- sum(x01 == 1)
+  pct <- 100 * n1 / length(x01)
+  paste0(n1, " (", sprintf("%.1f", pct), "%)")
+}
+
+fmt_p <- function(p) {
+  if (length(p) == 0) return("")
+  out <- rep("", length(p))
+  ok <- !is.na(p)
+  out[ok & p < 0.001] <- "<0.001"
+  out[ok & p >= 0.001] <- sprintf("%.3f", p[ok & p >= 0.001])
+  out
+}
+
+# ---------- prep ----------
+dp <- data_pd %>%
+  mutate(
+    ARM = factor(ARM, levels = c("IV", "NEB")),
+    Time_min = as.integer(gsub("^T", "", as.character(T_PROTO))),
+    Responder = dplyr::if_else(is.na(EN), NA_integer_, as.integer(EN < 4))
+  )
+
+# ---------- compute time-by-time table ----------
+tab_time_merged <- dp %>%
+  filter(!is.na(EN), !is.na(ARM), !is.na(Time_min)) %>%
+  group_by(Time_min) %>%
+  summarise(
+    N_overall = n(),
+    N_IV      = sum(ARM == "IV"),
+    N_NEB     = sum(ARM == "NEB"),
+
+    NRS_Overall = fmt_mean_sd(EN),
+    NRS_IV      = fmt_mean_sd(EN[ARM == "IV"]),
+    NRS_NEB     = fmt_mean_sd(EN[ARM == "NEB"]),
+
+    Relief_Overall = fmt_n_pct(Responder),
+    Relief_IV      = fmt_n_pct(Responder[ARM == "IV"]),
+    Relief_NEB     = fmt_n_pct(Responder[ARM == "NEB"]),
+
+    p_nrs_raw = {
+      if (N_IV >= 1 && N_NEB >= 1) {
+        tryCatch(stats::wilcox.test(EN ~ ARM, exact = FALSE)$p.value,
+                 error = function(e) NA_real_)
+      } else NA_real_
+    },
+
+    p_relief_raw = {
+      tab <- table(Responder, ARM)
+      if (all(dim(tab) == c(2, 2))) {
+        if (any(tab < 5)) stats::fisher.test(tab)$p.value
+        else suppressWarnings(stats::chisq.test(tab, correct = FALSE)$p.value)
+      } else NA_real_
+    },
+
+    .groups = "drop"
+  ) %>%
+  arrange(Time_min) %>%
+  mutate(
+    p_nrs   = fmt_p(p.adjust(p_nrs_raw, method = "holm")),
+    p_relief = fmt_p(p.adjust(p_relief_raw, method = "holm"))
+  ) %>%
+  transmute(
+    `Time (min)` = Time_min,
+    `N` = N_overall, `N (IV)` = N_IV, `N (NEB)` = N_NEB,
+
+    `Numeric Rating Scale` = NRS_Overall,
+    `Numeric Rating Scale (IV)` = NRS_IV,
+    `Numeric Rating Scale (NEB)` = NRS_NEB,
+    `p (NRS, Holm)` = p_nrs,
+
+    `NRS < 4` = Relief_Overall,
+    `NRS < 4 (IV)` = Relief_IV,
+    `NRS < 4 (NEB)` = Relief_NEB,
+    `p (NRS<4, Holm)` = p_relief
+  )
+
+ft_time <- flextable::flextable(tab_time_merged) %>%
+  flextable::theme_booktabs() %>%
+  flextable::font(fontname = "Times New Roman", part = "all") %>%
+  flextable::fontsize(size = 10, part = "all") %>%
+  flextable::padding(padding = 2, part = "all") %>%
+  flextable::bold(part = "header") %>%
+  flextable::align(align = "center", part = "all") %>%
+  flextable::align(j = 1, align = "center", part = "all") %>%
+  flextable::autofit()
+
+# Add a top header row to group columns
+ft_time <- flextable::add_header_row(
+  ft_time,
+  values = c(
+    "", "N", "Numeric Rating Scale (mean ± SD)", "Relief: NRS < 4 (n, %)"
+  ),
+  colwidths = c(
+    1, 3, 4, 4
+  )
+)
+
+# Optional: slightly shrink the very top header row
+ft_time <- flextable::fontsize(ft_time, i = 1, size = 9, part = "header")
+
+# Footnote
+ft_time <- flextable::add_footer_lines(
+  ft_time,
+  values = paste(
+    "Numeric Rating Scale (0–10). NRS shown as mean ± SD.",
+    "Relief defined as NRS < 4 at each timepoint (n, %).",
+    "P-values: Wilcoxon rank-sum for NRS; Chi-square or Fisher’s exact for Relief;",
+    "Holm correction applied across timepoints within each outcome."
+  )
+)
+
+ft_time
+
+
+doc <- officer::read_docx() %>%
+  officer::body_add_par("Table X. Numeric Rating Scale and Relief over time", style = "heading 2")
+
+doc <- flextable::body_add_flextable(doc, ft_time)
+
+print(doc, target = "Table_NRS_Relief_Time.docx")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+data_pd2 <- data_pd %>%
+  mutate(
+    ARM = factor(ARM, levels = c("IV", "NEB")),
+    Rescue = factor(Rescue, levels = c(0, 1), labels = c("No", "Yes")),
+    # numeric minutes from T_PROTO like "T0","T5","T10",...
+    Time_min = as.integer(gsub("^T", "", as.character(T_PROTO)))
+  ) %>%
+  # reorder factor levels by numeric time
+  mutate(
+    T_PROTO = factor(
+      T_PROTO,
+      levels = unique(T_PROTO[order(Time_min)])
+    )
+  )
+
+
+time_labels <- gsub("^T", "", levels(data_pd2$T_PROTO))
+
+# --------------------------
+# Summary function
+# --------------------------
+summ_mean_sem <- function(df, group_vars) {
+  df %>%
+    filter(!is.na(EN), !is.na(T_PROTO)) %>%
+    group_by(across(all_of(group_vars))) %>%
+    summarise(
+      n = sum(!is.na(EN)),
+      mean = mean(EN, na.rm = TRUE),
+      sd = sd(EN, na.rm = TRUE),
+      sem = sd / sqrt(n),
+      .groups = "drop"
+    )
+}
+
+# --------------------------
+# 1) Overall
+# --------------------------
+sum_overall <- summ_mean_sem(data_pd2, c("T_PROTO"))
+
+p1 <- ggplot(sum_overall,
+             aes(x = T_PROTO, y = mean, group = 1)) +
+  geom_ribbon(aes(ymin = mean - sd, ymax = mean + sd),
+              alpha = 0.2) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  scale_x_discrete(labels = time_labels) +
+  labs(
+    x = "Time (min)",
+    y = "Numeric Rating Scale"
+  ) +
+  my_theme
+
+# --------------------------
+# 2) Split by ARM (same panel)
+# --------------------------
+summ_mean_sd_by_time <- function(df, group_vars) {
+  df %>%
+    filter(!is.na(EN), !is.na(Time_min)) %>%
+    group_by(across(all_of(group_vars))) %>%
+    summarise(
+      n = sum(!is.na(EN)),
+      mean = mean(EN, na.rm = TRUE),
+      sd = sd(EN, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+sum_arm_numx <- summ_mean_sd_by_time(data_pd2, c("ARM", "Time_min"))
+
+p2_numx <- ggplot(sum_arm_numx,
+                  aes(x = Time_min, y = mean, color = ARM, fill = ARM, group = ARM)) +
+  geom_ribbon(aes(ymin = mean - sd, ymax = mean + sd), alpha = 0.2, color = NA) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  scale_color_jco() +
+  scale_fill_jco() +
+  scale_x_continuous(breaks = sort(unique(data_pd2$Time_min))) +
+  labs(x = "Time (min)", y = "Numeric Rating Scale", color = "Arm", fill = "Arm") +
+  my_theme
+
+p_tab_num <- data_pd2 %>%
+  filter(!is.na(EN), !is.na(ARM), !is.na(Time_min)) %>%
+  group_by(Time_min) %>%
+  summarise(
+    p_raw = tryCatch(wilcox.test(EN ~ ARM, exact = FALSE)$p.value,
+                     error = function(e) NA_real_),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adj = p.adjust(p_raw, method = "holm"),
+    star = dplyr::case_when(
+      is.na(p_adj)  ~ "",
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01  ~ "**",
+      p_adj < 0.05  ~ "*",
+      TRUE          ~ ""
+    )
+  )
+
+y_pos_num <- sum_arm_numx %>%
+  group_by(Time_min) %>%
+  summarise(y = max(mean + sd, na.rm = TRUE), .groups = "drop") %>%
+  mutate(y = y + 0.6)
+
+ann_num <- left_join(p_tab_num, y_pos_num, by = "Time_min") %>%
+  filter(star != "" & !is.na(y))
+
+p2_star <- p2_numx +
+  geom_text(
+    data = ann_num,
+    aes(x = Time_min, y = y, label = star),
+    inherit.aes = FALSE,
+    size = 10,
+    color = "black",
+    vjust = 0
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.12)))
+
+
+
+# --------------------------
+# Arrange
+# --------------------------
+fig1<-ggarrange(p1, p2_star,
+          ncol = 2, nrow = 1,
+          labels = c("A","B"))
+
+
+png("Fig1.png", width = 16, height = 9, units = 'in', res = 900)  
+print(fig1)
+dev.off()
 
 
 
