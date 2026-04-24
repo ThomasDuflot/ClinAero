@@ -443,8 +443,8 @@ ft <- flextable(final_table %>% select(Variable, Overall, IV, NEB, p_value_txt))
     p_value_txt = "p-value"
   ) %>%
   theme_booktabs() %>%
-  font(fontname = "Times New Roman", part = "all") %>%
-  fontsize(size = 10, part = "all") %>%
+  flextable::font(fontname = "Times New Roman", part = "all") %>%
+  flextable::fontsize(size = 10, part = "all") %>%
   padding(padding = 2, part = "all") %>%
   bold(part = "header") %>%
   align(align = "left", j = 1, part = "all") %>%
@@ -936,4 +936,744 @@ print(fig1)
 dev.off()
 
 
+
+
+
+
+
+library(tidyr)
+
+# ============================================================
+# 1) Dataset patient-time complet
+# ============================================================
+
+all_times <- sort(unique(data_pd2$Time_min[!is.na(data_pd2$Time_min)]))
+
+dp_cum <- data_pd2 %>%
+  select(ID, ARM, Time_min, EN) %>%
+  filter(!is.na(ID), !is.na(ARM), !is.na(Time_min)) %>%
+  arrange(ID, Time_min) %>%
+  group_by(ID, ARM, Time_min) %>%
+  summarise(
+    EN = if (all(is.na(EN))) NA_real_ else EN[which(!is.na(EN))[1]],
+    .groups = "drop"
+  ) %>%
+  group_by(ID, ARM) %>%
+  tidyr::complete(
+    Time_min = all_times
+  ) %>%
+  arrange(ID, Time_min) %>%
+  mutate(
+    Relief_inst = dplyr::if_else(
+      !is.na(EN) & EN < 4,
+      1L,
+      0L
+    ),
+    CumRelief = cummax(Relief_inst)
+  ) %>%
+  ungroup()
+
+
+
+# ============================================================
+# 2) Résumé cumulatif par bras et par temps
+# ============================================================
+
+cumrelief_sum <- dp_cum %>%
+  group_by(ARM, Time_min) %>%
+  summarise(
+    n = n_distinct(ID),
+    n_relief = sum(CumRelief == 1, na.rm = TRUE),
+    pct_relief = 100 * n_relief / n,
+    .groups = "drop"
+  )
+
+
+p_cumrelief <- ggplot(
+  cumrelief_sum,
+  aes(x = Time_min, y = pct_relief, color = ARM, group = ARM)
+) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  scale_color_jco() +
+  scale_x_continuous(breaks = all_times) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 20),
+    labels = function(x) paste0(x, "%")
+  ) +
+  labs(
+    x = "Time (min)",
+    y = "Cumulative relief (%)",
+    color = "Arm"
+  ) +
+  my_theme
+
+p_cumrelief
+
+# ============================================================
+# Survival-like curve:
+# proportion without cumulative relief over time
+# ============================================================
+
+survrelief_sum <- dp_cum %>%
+  group_by(ARM, Time_min) %>%
+  summarise(
+    n = n_distinct(ID),
+    n_relief = sum(CumRelief == 1, na.rm = TRUE),
+    n_no_relief = n - n_relief,
+    pct_no_relief = 100 * n_no_relief / n,
+    .groups = "drop"
+  )
+
+p_no_cumrelief <- ggplot(
+  survrelief_sum,
+  aes(x = Time_min, y = pct_no_relief, color = ARM, group = ARM)
+) +
+  geom_step(linewidth = 1.2, direction = "hv") +
+  geom_point(size = 2.5) +
+  scale_color_jco() +
+  scale_x_continuous(breaks = all_times) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 20),
+    labels = function(x) paste0(x, "%")
+  ) +
+  labs(
+    x = "Time (min)",
+    y = "Patients without relief (%)",
+    color = "Arm"
+  ) +
+  my_theme
+
+p_no_cumrelief
+
+# ============================================================
+# Time-to-relief analysis
+# Event = first occurrence of NRS < 4
+# Reference arm = IV
+# Kaplan-Meier / exploratory Cox model
+# ============================================================
+
+library(dplyr)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(ggsci)
+
+# ------------------------------------------------------------
+# 1) Theme
+# ------------------------------------------------------------
+
+my_theme <- theme_minimal(base_size = 16) +
+  theme(
+    axis.title = element_text(size = 18, color = "black"),
+    axis.text = element_text(size = 16, color = "black"),
+    axis.line = element_line(linewidth = 1.5),
+    legend.title = element_text(size = 18, color = "black"),
+    legend.text = element_text(size = 16, color = "black")
+  )
+
+# ------------------------------------------------------------
+# 2) Patient-level survival dataset
+# ------------------------------------------------------------
+
+surv_data <- data_pd2 %>%
+  filter(!is.na(ID), !is.na(ARM), !is.na(Time_min)) %>%
+  arrange(ID, Time_min) %>%
+  group_by(ID) %>%
+  summarise(
+    ARM = first(ARM),
+    
+    # First timepoint where NRS < 4
+    time_to_relief = if (any(!is.na(EN) & EN < 4)) {
+      min(Time_min[!is.na(EN) & EN < 4])
+    } else {
+      max(Time_min[!is.na(EN)])
+    },
+    
+    # Event indicator
+    # 1 = relief reached at least once
+    # 0 = never reached relief, censored at last observed time
+    event_relief = as.integer(any(!is.na(EN) & EN < 4)),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(
+    ARM = factor(ARM, levels = c("IV", "NEB"))
+  )
+
+# Check number of events / censored patients
+table(surv_data$ARM, surv_data$event_relief)
+
+# ------------------------------------------------------------
+# 3) Kaplan-Meier fit
+# ------------------------------------------------------------
+
+fit_km <- survfit(
+  Surv(time_to_relief, event_relief) ~ ARM,
+  data = surv_data
+)
+
+# ------------------------------------------------------------
+# 4) Exploratory Cox model
+# ------------------------------------------------------------
+
+cox_model <- coxph(
+  Surv(time_to_relief, event_relief) ~ ARM,
+  data = surv_data,
+  ties = "efron"
+)
+
+summary(cox_model)
+
+# ------------------------------------------------------------
+# 5) Extract HR, 95% CI and p-value
+# IV is the reference group
+# ------------------------------------------------------------
+
+cox_res <- summary(cox_model)
+
+hr      <- cox_res$conf.int["ARMNEB", "exp(coef)"]
+ci_low  <- cox_res$conf.int["ARMNEB", "lower .95"]
+ci_high <- cox_res$conf.int["ARMNEB", "upper .95"]
+p_val   <- cox_res$coefficients["ARMNEB", "Pr(>|z|)"]
+
+p_txt <- ifelse(
+  p_val < 0.001,
+  "<0.001",
+  sprintf("%.3f", p_val)
+)
+
+cox_text <- paste0(
+  "NEB vs IV: HR = ",
+  sprintf("%.2f", hr),
+  " [95% CI: ",
+  sprintf("%.2f", ci_low),
+  "–",
+  sprintf("%.2f", ci_high),
+  "], p = ",
+  p_txt
+)
+
+cox_text
+
+
+# ------------------------------------------------------------
+# 6) Kaplan-Meier plot
+# ------------------------------------------------------------
+
+p_km <- ggsurvplot(
+  fit_km,
+  data = surv_data,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  pval = FALSE,              # on met notre texte HR/p-value nous-mêmes
+  censor = TRUE,
+  censor.shape = 124,        # vertical tick for censored observations
+  censor.size = 5,
+  size = 1.6,                # thicker KM lines
+  palette = "jco",
+  break.time.by = 5,
+  xlab = "Time (min)",
+  ylab = "Patients not yet relieved",
+  legend.title = "Arm",
+  legend.labs = c("IV", "NEB"),
+  risk.table.height = 0.25,
+  risk.table.y.text = TRUE,        # affiche IV / NEB
+  risk.table.y.text.col = FALSE,   # labels en noir
+  ggtheme = my_theme
+)
+
+# ------------------------------------------------------------
+# 7) Main plot customisation
+# ------------------------------------------------------------
+
+p_km$plot <- p_km$plot +
+  scale_color_jco(name = "Arm") +
+  scale_fill_jco(name = "Arm") +
+  scale_x_continuous(
+    breaks = seq(0, max(surv_data$time_to_relief, na.rm = TRUE), by = 5),
+    limits = c(0, max(surv_data$time_to_relief, na.rm = TRUE))
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2),
+    labels = function(x) paste0(x * 100, "%")
+  ) +
+  labs(
+    x = "Time (min)",
+    y = "Patients not yet relieved (%)",
+    color = "Arm",
+    fill = "Arm"
+  ) +
+  annotate(
+    "text",
+    x = 2,
+    y = 0.08,
+    label = cox_text,
+    size = 5,
+    hjust = 0,
+    vjust = 0,
+    color = "black"
+  ) +
+  my_theme +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+# ------------------------------------------------------------
+# 8) Risk table customisation
+# ------------------------------------------------------------
+
+p_km$table <- p_km$table +
+  scale_color_jco(name = "Arm") +
+  my_theme +
+  labs(y = "Arm") +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_text(size = 18, color = "black"),
+    axis.text.x = element_text(size = 14, color = "black"),
+    axis.text.y = element_text(size = 14, color = "black"),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  )
+
+p_km
+
+
+# ------------------------------------------------------------
+# 9) Export figure
+# ------------------------------------------------------------
+
+png("Fig_KM_Time_to_Relief_Cox.png", width = 9, height = 8, units = "in", res = 900)
+print(p_km)
+dev.off()
+
+
+# ------------------------------------------------------------
+# 10) Cox result table
+# ------------------------------------------------------------
+
+cox_table <- data.frame(
+  Comparison = "NEB vs IV",
+  HR = sprintf("%.2f", hr),
+  CI95 = paste0(
+    sprintf("%.2f", ci_low),
+    "–",
+    sprintf("%.2f", ci_high)
+  ),
+  p_value = p_txt
+)
+
+cox_table
+
+
+
+# ============================================================
+# Full parametric time-to-relief analysis
+# Event = first occurrence of NRS < 4
+# Reference arm = IV
+# ============================================================
+
+library(dplyr)
+library(survival)
+library(flexsurv)
+library(ggplot2)
+library(ggsci)
+library(flextable)
+library(officer)
+
+# ------------------------------------------------------------
+# 1) Patient-level survival dataset
+# ------------------------------------------------------------
+
+surv_data <- data_pd2 %>%
+  filter(!is.na(ID), !is.na(ARM), !is.na(Time_min)) %>%
+  arrange(ID, Time_min) %>%
+  group_by(ID) %>%
+  summarise(
+    ARM = first(ARM),
+    
+    time_to_relief = if (any(!is.na(EN) & EN < 4)) {
+      min(Time_min[!is.na(EN) & EN < 4])
+    } else {
+      max(Time_min[!is.na(EN)])
+    },
+    
+    event_relief = as.integer(any(!is.na(EN) & EN < 4)),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(
+    ARM = factor(ARM, levels = c("IV", "NEB"))
+  )
+
+table(surv_data$ARM, surv_data$event_relief)
+
+
+# ------------------------------------------------------------
+# 3) Fit candidate parametric survival models
+# ------------------------------------------------------------
+
+fit_exp <- flexsurvreg(
+  Surv(time_model, event_relief) ~ ARM,
+  data = surv_data_param,
+  dist = "exponential"
+)
+
+fit_weibull <- flexsurvreg(
+  Surv(time_model, event_relief) ~ ARM,
+  data = surv_data_param,
+  dist = "weibull"
+)
+
+fit_lognormal <- flexsurvreg(
+  Surv(time_model, event_relief) ~ ARM,
+  data = surv_data_param,
+  dist = "lognormal"
+)
+
+fit_loglogistic <- flexsurvreg(
+  Surv(time_model, event_relief) ~ ARM,
+  data = surv_data_param,
+  dist = "llogis"
+)
+
+fit_gamma <- flexsurvreg(
+  Surv(time_model, event_relief) ~ ARM,
+  data = surv_data_param,
+  dist = "gamma"
+)
+
+# ------------------------------------------------------------
+# 4) AIC comparison
+# ------------------------------------------------------------
+
+aic_table <- data.frame(
+  Model = c("Exponential", "Weibull", "Log-normal", "Log-logistic", "Gamma"),
+  AIC = c(
+    fit_exp$AIC,
+    fit_weibull$AIC,
+    fit_lognormal$AIC,
+    fit_loglogistic$AIC,
+    fit_gamma$AIC
+  )
+) %>%
+  arrange(AIC) %>%
+  mutate(
+    Delta_AIC = AIC - min(AIC)
+  )
+
+aic_table
+
+# ------------------------------------------------------------
+# 5) Select best model by AIC
+# ------------------------------------------------------------
+
+fits <- list(
+  Exponential = fit_exp,
+  Weibull = fit_weibull,
+  Lognormal = fit_lognormal,
+  Loglogistic = fit_loglogistic,
+  Gamma = fit_gamma
+)
+
+best_model_name <- aic_table$Model[1]
+
+best_fit <- switch(
+  best_model_name,
+  "Exponential" = fit_exp,
+  "Weibull" = fit_weibull,
+  "Log-normal" = fit_lognormal,
+  "Log-logistic" = fit_loglogistic,
+  "Gamma" = fit_gamma
+)
+
+best_model_name
+best_fit
+
+# ------------------------------------------------------------
+# 6) Parametric predictions
+# ------------------------------------------------------------
+
+times_pred <- seq(0.01, 60, by = 0.1)
+
+new_iv <- data.frame(
+  ARM = factor("IV", levels = c("IV", "NEB"))
+)
+
+new_neb <- data.frame(
+  ARM = factor("NEB", levels = c("IV", "NEB"))
+)
+
+pred_iv <- summary(
+  best_fit,
+  newdata = new_iv,
+  type = "survival",
+  t = times_pred,
+  ci = TRUE
+)[[1]]
+
+pred_neb <- summary(
+  best_fit,
+  newdata = new_neb,
+  type = "survival",
+  t = times_pred,
+  ci = TRUE
+)[[1]]
+
+pred_param <- bind_rows(
+  data.frame(
+    Time_min = pred_iv$time,
+    surv = pred_iv$est,
+    lcl = pred_iv$lcl,
+    ucl = pred_iv$ucl,
+    ARM = "IV"
+  ),
+  data.frame(
+    Time_min = pred_neb$time,
+    surv = pred_neb$est,
+    lcl = pred_neb$lcl,
+    ucl = pred_neb$ucl,
+    ARM = "NEB"
+  )
+) %>%
+  mutate(
+    ARM = factor(ARM, levels = c("IV", "NEB"))
+  )
+
+# ------------------------------------------------------------
+# 7) KM observed data for overlay
+# ------------------------------------------------------------
+
+fit_km <- survfit(
+  Surv(time_model, event_relief) ~ ARM,
+  data = surv_data_param
+)
+
+km_df <- survminer::surv_summary(fit_km, data = surv_data_param) %>%
+  mutate(
+    ARM = gsub("^ARM=", "", strata),
+    ARM = factor(ARM, levels = c("IV", "NEB"))
+  )
+
+# ------------------------------------------------------------
+# 8) Plot: parametric curves + KM steps
+# ------------------------------------------------------------
+
+p_param <- ggplot() +
+  geom_ribbon(
+    data = pred_param,
+    aes(x = Time_min, ymin = lcl, ymax = ucl, fill = ARM),
+    alpha = 0.18
+  ) +
+  geom_line(
+    data = pred_param,
+    aes(x = Time_min, y = surv, color = ARM),
+    linewidth = 1.6
+  ) +
+  geom_step(
+    data = km_df,
+    aes(x = time, y = surv, color = ARM),
+    linewidth = 0.9,
+    linetype = "dashed"
+  ) +
+  scale_color_jco(name = "Arm") +
+  scale_fill_jco(name = "Arm") +
+  scale_x_continuous(
+    breaks = seq(0, 60, by = 5),
+    limits = c(0, 60)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2),
+    labels = function(x) paste0(x * 100, "%")
+  ) +
+  labs(
+    x = "Time (min)",
+    y = "Patients not yet relieved (%)",
+    title = paste0("Parametric time-to-relief model: ", best_model_name),
+    subtitle = "Solid lines: parametric model; dashed lines: Kaplan–Meier estimate"
+  ) +
+  my_theme +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 18, face = "bold", color = "black"),
+    plot.subtitle = element_text(size = 14, color = "black")
+  )
+
+p_param
+
+png("Fig_Parametric_Time_to_Relief.png", width = 9, height = 7, units = "in", res = 900)
+print(p_param)
+dev.off()
+
+
+# ------------------------------------------------------------
+# 10) Word export: AIC table + predicted probabilities
+# ------------------------------------------------------------
+
+ft_aic <- flextable(aic_table) %>%
+  theme_booktabs() %>%
+  font(fontname = "Times New Roman", part = "all") %>%
+  fontsize(size = 10, part = "all") %>%
+  padding(padding = 2, part = "all") %>%
+  bold(part = "header") %>%
+  align(align = "center", part = "all") %>%
+  autofit() %>%
+  add_footer_lines(
+    values = "Candidate parametric survival models for time-to-relief. Lower AIC indicates better relative fit."
+  )
+
+ft_pred <- flextable(pred_key_table_relief) %>%
+  theme_booktabs() %>%
+  flextable::font(fontname = "Times New Roman", part = "all") %>%
+  flextable::fontsize(size = 10, part = "all") %>%
+  padding(padding = 2, part = "all") %>%
+  bold(part = "header") %>%
+  align(align = "center", part = "all") %>%
+  autofit() %>%
+  add_footer_lines(
+    values = paste0(
+      "Predicted probability of relief from the best-fitting parametric survival model: ",
+      best_model_name,
+      ". Relief was defined as the first occurrence of NRS < 4."
+    )
+  )
+
+doc <- read_docx() %>%
+  body_add_par("Parametric time-to-relief analysis", style = "heading 2") %>%
+  body_add_par("Model comparison", style = "heading 3") %>%
+  body_add_flextable(ft_aic) %>%
+  body_add_par("Predicted probability of relief", style = "heading 3") %>%
+  body_add_flextable(ft_pred)
+
+print(doc, target = "Parametric_Time_to_Relief.docx")
+
+
+
+
+
+
+
+
+# ============================================================
+# Best parametric model plot: Log-normal
+# Model prediction + model 95% CI
+# Observed points + observed binomial 95% CI
+# Outcome = patients not yet relieved
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(survival)
+library(ggplot2)
+library(ggsci)
+library(MASS)
+
+# ------------------------------------------------------------
+# 1) Refit log-normal model if needed
+# ------------------------------------------------------------
+
+fit_lognormal <- survreg(
+  Surv(time_model, event_relief) ~ ARM,
+  data = surv_data_param,
+  dist = "lognormal"
+)
+
+summary(fit_lognormal)
+AIC(fit_lognormal)
+
+
+# ------------------------------------------------------------
+# 2) Prediction helper with coefficient simulation
+# ------------------------------------------------------------
+
+# ------------------------------------------------------------
+# Prediction helper with coefficient simulation
+# Robust version for survreg objects
+# ------------------------------------------------------------
+
+predict_survreg_ci <- function(fit, times, arm_values = c("IV", "NEB"), n_sim = 2000) {
+  
+  beta_hat <- stats::coef(fit)
+  
+  # vcov(fit) may include additional parameters such as log(scale)
+  vcov_full <- stats::vcov(fit)
+  vcov_beta <- vcov_full[names(beta_hat), names(beta_hat), drop = FALSE]
+  
+  scale_hat <- fit$scale
+  
+  beta_sim <- MASS::mvrnorm(
+    n = n_sim,
+    mu = beta_hat,
+    Sigma = vcov_beta
+  )
+  
+  out <- list()
+  
+  for (arm in arm_values) {
+    
+    newdata <- data.frame(
+      ARM = factor(arm, levels = c("IV", "NEB"))
+    )
+    
+    # Safer model matrix construction
+    X <- stats::model.matrix(
+      stats::delete.response(stats::terms(fit)),
+      newdata
+    )
+    
+    # Ensure same columns as beta
+    X <- X[, names(beta_hat), drop = FALSE]
+    
+    lp_hat <- as.numeric(X %*% beta_hat)
+    
+    lp_sim <- as.numeric(beta_sim %*% as.numeric(X))
+    
+    surv_hat <- 1 - survival::psurvreg(
+      q = times,
+      mean = lp_hat,
+      scale = scale_hat,
+      distribution = fit$dist
+    )
+    
+    surv_sim <- sapply(lp_sim, function(lp_i) {
+      1 - survival::psurvreg(
+        q = times,
+        mean = lp_i,
+        scale = scale_hat,
+        distribution = fit$dist
+      )
+    })
+    
+    surv_lcl <- apply(surv_sim, 1, stats::quantile, probs = 0.025, na.rm = TRUE)
+    surv_ucl <- apply(surv_sim, 1, stats::quantile, probs = 0.975, na.rm = TRUE)
+    
+    out[[arm]] <- data.frame(
+      Time_min = times,
+      surv = surv_hat,
+      lcl = surv_lcl,
+      ucl = surv_ucl,
+      ARM = arm
+    )
+  }
+  
+  dplyr::bind_rows(out) %>%
+    dplyr::mutate(
+      ARM = factor(ARM, levels = c("IV", "NEB"))
+    )
+}
+
+
+times_pred <- seq(0.01, max(all_times), by = 0.1)
+
+pred_lognormal_ci <- predict_survreg_ci(
+  fit = fit_lognormal,
+  times = times_pred,
+  arm_values = c("IV", "NEB"),
+  n_sim = 2000
+)
 
